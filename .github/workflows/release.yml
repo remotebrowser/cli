@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-musl, name: linux-x86_64 }
+          - { target: aarch64-linux-musl, name: linux-aarch64 }
+          - { target: arm-linux-musleabihf, name: linux-armv7 }
+          - { target: riscv64-linux-musl, name: linux-riscv64 }
+          - { target: x86_64-macos, name: macos-x86_64 }
+          - { target: aarch64-macos, name: macos-aarch64 }
+          - { target: x86_64-windows, name: windows-x86_64 }
+          - { target: aarch64-windows, name: windows-aarch64 }
+          - { target: x86_64-freebsd, name: freebsd-x86_64 }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall -Dstrip=true
+
+      - name: Package
+        id: package
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          dir=remotebrowser-$version-${{ matrix.name }}
+          mkdir "$dir"
+          cp zig-out/bin/* LICENSE README.md "$dir"/
+          if [[ ${{ matrix.name }} == windows-* ]]; then
+            zip -r "$dir.zip" "$dir"
+            echo "archive=$dir.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "$dir.tar.gz" "$dir"
+            echo "archive=$dir.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: remotebrowser-${{ matrix.name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Check that the tag matches the version
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match version $version in build.zig.zon" >&2
+            exit 1
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
