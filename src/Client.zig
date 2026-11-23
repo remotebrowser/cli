@@ -20,6 +20,7 @@ const user_agent = "remotebrowser-cli/" ++ build_options.version;
 gpa: Allocator,
 /// Allocates the parsed responses and the error messages, which the caller frees all at once.
 arena: Allocator,
+/// Empty for the login endpoints, which need no authentication.
 api_key: []const u8,
 /// Without the trailing slash.
 base_url: []const u8,
@@ -38,6 +39,8 @@ pub const ApiError = struct {
     message: []const u8,
     retry_after: ?f64 = null,
     timed_out: bool = false,
+    /// The parsed response body, so callers can read error codes such as OAuth's "error" field.
+    body: std.json.Value = .null,
 };
 
 pub const Error = error{ ApiFailed, OutOfMemory };
@@ -67,6 +70,14 @@ pub fn deinit(client: *Client) void {
 
 pub fn errorMessage(client: *const Client) []const u8 {
     return if (client.last_error) |err| err.message else "unknown error";
+}
+
+/// The "error" field of the last error response, such as "authorization_pending".
+pub fn errorCode(client: *const Client) ?[]const u8 {
+    const err = client.last_error orelse return null;
+    if (err.body != .object) return null;
+    const value = err.body.object.get("error") orelse return null;
+    return if (value == .string) value.string else null;
 }
 
 /// Sends a request and returns the parsed JSON response, or a string when the body is not JSON,
@@ -110,7 +121,7 @@ fn makeRequest(client: *Client, method: std.http.Method, path: []const u8, body:
         // Not followed, so the API key never goes to another host.
         .redirect_behavior = .unhandled,
         .headers = .{
-            .authorization = .{ .override = authorization },
+            .authorization = if (client.api_key.len == 0) .omit else .{ .override = authorization },
             .user_agent = .{ .override = user_agent },
             .content_type = if (body != null or method.requestHasBody())
                 .{ .override = "application/json" }
@@ -166,6 +177,7 @@ fn makeRequest(client: *Client, method: std.http.Method, path: []const u8, body:
             .status = status,
             .message = try errorText(client.arena, status, parsed),
             .retry_after = retry_after,
+            .body = parsed,
         });
     }
     return parsed;

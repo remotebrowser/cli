@@ -35,6 +35,7 @@ expect_exit() { # expect_exit <description> <code> <command>...
 }
 
 expect "version" "." "$("$RB" --version)"
+expect "status uses the API key" "credentials: REMOTEBROWSER_API_KEY" "$("$RB" status)"
 expect_exit "usage error" 2 "$RB" get
 expect_exit "unknown browser" 1 "$RB" get Bnonexistent
 
