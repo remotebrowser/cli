@@ -14,22 +14,34 @@ pub const version = build_options.version;
 const description = "Manage browsers on Remote Browser from the command line.";
 
 const epilog =
-    \\environment:
-    \\  REMOTEBROWSER_API_KEY  API key (required)
-    \\  REMOTEBROWSER_URL      base URL of the Remote Browser API (required)
+    \\To log in with a web browser, run "remotebrowser login URL" once per
+    \\server. Commands use the server of the last login (see "switch"), or
+    \\the one given with --url or REMOTEBROWSER_URL. Or set both
+    \\REMOTEBROWSER_API_KEY and REMOTEBROWSER_URL.
     \\
-    \\The CDP endpoint printed by "connect" needs the API key in the header
-    \\"Authorization: Bearer $REMOTEBROWSER_API_KEY".
+    \\environment:
+    \\  REMOTEBROWSER_API_KEY     API key, used instead of the login
+    \\  REMOTEBROWSER_URL         base URL of the Remote Browser server
+    \\  REMOTEBROWSER_CONFIG_DIR  where the login is stored
+    \\
+    \\The CDP endpoint printed by "connect" needs the key in the header
+    \\"Authorization: Bearer $(remotebrowser token)".
     \\
 ;
 
-const main_usage = "[-h] [-v] [--json] <command> ...";
+const main_usage = "[-h] [-v] [--json] [--url URL] <command> ...";
 
 pub const Options = struct {
     /// From REMOTEBROWSER_API_KEY.
     api_key: ?[]const u8 = null,
     /// From REMOTEBROWSER_URL.
     base_url: ?[]const u8 = null,
+    /// The directory of the credentials file. Without it, the CLI cannot log in.
+    config_dir: ?[]const u8 = null,
+    /// Shown on the approval page of a login.
+    device_name: ?[]const u8 = null,
+    /// Opens a URL in the web browser; tests replace it so nothing is launched.
+    open_url: *const fn (gpa: Allocator, url: []const u8) void = openUrl,
     timeout_ms: u32 = Client.default_timeout_ms,
     max_retries: u32 = Client.default_max_retries,
     /// Seconds between the status checks of `create --wait`.
@@ -82,12 +94,22 @@ const Command = struct {
     options: []const Option = &.{},
     /// The name of the positional argument, if any.
     positional: ?[]const u8 = null,
+    /// Help for the positional argument; browser ids by default.
+    positional_help: ?[]const u8 = null,
     /// Whether the positional argument takes one or more values.
     many: bool = false,
+    /// Whether the positional argument may be left out.
+    optional: bool = false,
     handler: *const fn (*Cli, *const Args) Failure!void,
 };
 
 const json_option: Option = .{ .name = "--json", .dest = "json", .kind = .flag, .help = "print the raw JSON response" };
+const url_option: Option = .{
+    .name = "--url",
+    .dest = "url",
+    .metavar = "URL",
+    .help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+};
 
 const commands = [_]Command{
     .{
@@ -131,8 +153,11 @@ const commands = [_]Command{
     .{
         .name = "list",
         .aliases = &.{"ls"},
-        .help = "print the ids of the starting and running browsers",
-        .usage = "[-h] [--json]",
+        .help = "print the ids of the active browsers",
+        .usage = "[-h] [--json] [url]",
+        .positional = "url",
+        .positional_help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+        .optional = true,
         .handler = list,
     },
     .{
@@ -176,6 +201,54 @@ const commands = [_]Command{
         .handler = connect,
     },
     .{
+        .name = "login",
+        .help = "log in with a web browser",
+        .usage = "[-h] [--days DAYS] [--no-browser] [url]",
+        .positional = "url",
+        .positional_help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+        .optional = true,
+        .options = &.{
+            .{
+                .name = "--days",
+                .dest = "days",
+                .kind = .int,
+                .metavar = "DAYS",
+                .help = "how long the login lasts (the server sets the maximum)",
+            },
+            .{ .name = "--no-browser", .dest = "no_browser", .kind = .flag, .help = "only print the URL" },
+        },
+        .handler = logIn,
+    },
+    .{
+        .name = "logout",
+        .help = "revoke the login to a server and delete it from this computer",
+        .usage = "[-h] [url]",
+        .positional = "url",
+        .positional_help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+        .optional = true,
+        .handler = logOut,
+    },
+    .{
+        .name = "status",
+        .help = "list the logins and show which one is used",
+        .usage = "[-h] [--json] [--url URL]",
+        .handler = showStatus,
+    },
+    .{
+        .name = "switch",
+        .help = "choose the server that commands use by default",
+        .usage = "[-h] url",
+        .positional = "url",
+        .positional_help = "base URL of a server you are logged in to",
+        .handler = switchServer,
+    },
+    .{
+        .name = "token",
+        .help = "print the token, for the CDP Authorization header",
+        .usage = "[-h] [--json] [--url URL]",
+        .handler = printToken,
+    },
+    .{
         .name = "config get",
         .help = "show the configuration of a browser",
         .usage = "[-h] [--json] id",
@@ -200,9 +273,30 @@ const commands = [_]Command{
     },
 };
 
-const config_help = "show or change the configuration of a browser";
-const config_usage = "[-h] <command> ...";
+/// Commands with subcommands, such as "config get".
+const Group = struct { name: []const u8, help: []const u8 };
+
+const groups = [_]Group{
+    .{ .name = "config", .help = "show or change the configuration of a browser" },
+};
+
+const group_usage = "[-h] <command> ...";
 const help_help = "show this help";
+
+fn findGroup(name: []const u8) ?*const Group {
+    for (&groups) |*group| {
+        if (std.mem.eql(u8, group.name, name)) return group;
+    }
+    return null;
+}
+
+/// The name of a subcommand without its group, or null if the command is not in the group.
+fn subcommandName(group: *const Group, command: *const Command) ?[]const u8 {
+    const name = command.name;
+    if (name.len <= group.name.len or !std.mem.startsWith(u8, name, group.name)) return null;
+    if (name[group.name.len] != ' ') return null;
+    return name[group.name.len + 1 ..];
+}
 
 fn findCommand(name: []const u8) ?*const Command {
     for (&commands) |*command| {
@@ -246,7 +340,14 @@ const Cli = struct {
     json_output: bool = false,
     api: ?Client = null,
     message: []const u8 = "",
-    /// Which usage line to print with a usage error: "" for the program, or "config".
+    /// From --url, which may come before or after the command.
+    url_flag: ?[]const u8 = null,
+    /// Where the token of `api` came from, to give a hint when the server rejects it.
+    source: ?Source = null,
+    /// Loaded on first use; see `loadStore`.
+    store: Store = .{},
+    store_loaded: bool = false,
+    /// Which usage line to print with a usage error: "" for the program, or a command name.
     usage_of: []const u8 = "",
     usage: []const u8 = main_usage,
 
@@ -268,7 +369,10 @@ const Cli = struct {
                 return 1;
             },
             error.ApiFailed => {
-                cli.printError("{s}", .{cli.api.?.errorMessage()});
+                const api = &cli.api.?;
+                cli.printError("{s}", .{api.errorMessage()});
+                const status = if (api.last_error) |e| e.status else null;
+                if (status == 401 and cli.source == .login) cli.printError("Run '{s} login' to log in again.", .{prog});
                 return 1;
             },
             error.OutOfMemory => {
@@ -303,20 +407,18 @@ const Cli = struct {
             if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
                 return cli.line(version);
             }
-            if (std.mem.eql(u8, arg, "--json")) {
-                cli.json_output = true;
-            } else if (isOption(arg)) {
-                return cli.usageError("unrecognized arguments: {s}", .{arg});
-            } else break;
+            if (try cli.globalOption(argv, &i)) continue;
+            if (isOption(arg)) return cli.usageError("unrecognized arguments: {s}", .{arg});
+            break;
         }
         if (i == argv.len) return cli.printMainHelp();
 
         const name = argv[i];
         const rest = argv[i + 1 ..];
         if (std.mem.eql(u8, name, "help")) return cli.help(rest);
-        if (std.mem.eql(u8, name, "config")) return cli.config(rest);
+        if (findGroup(name)) |group| return cli.runGroup(group, rest);
         const command = findCommand(name) orelse {
-            if (std.mem.startsWith(u8, name, "config ")) return cli.usageError("invalid command '{s}'", .{name});
+            if (std.mem.indexOfScalar(u8, name, ' ') != null) return cli.usageError("invalid command '{s}'", .{name});
             return cli.usageError("invalid command '{s}' (run '{s} help')", .{ name, prog });
         };
         return cli.runCommand(command, rest);
@@ -325,7 +427,7 @@ const Cli = struct {
     fn help(cli: *Cli, argv: []const []const u8) Failure!void {
         if (argv.len == 0) return cli.printMainHelp();
         if (argv.len == 1) {
-            if (std.mem.eql(u8, argv[0], "config")) return cli.printConfigHelp();
+            if (findGroup(argv[0])) |group| return cli.printGroupHelp(group);
             if (findCommand(argv[0])) |command| return cli.printCommandHelp(command);
         }
         cli.usage_of = "help";
@@ -334,19 +436,25 @@ const Cli = struct {
         return cli.usageError("invalid command '{s}'", .{joined});
     }
 
-    fn config(cli: *Cli, argv: []const []const u8) Failure!void {
-        cli.usage_of = "config";
-        cli.usage = config_usage;
-        for (argv, 0..) |arg, i| {
-            if (isHelp(arg)) return cli.printConfigHelp();
-            if (std.mem.eql(u8, arg, "--json")) {
-                cli.json_output = true;
-                continue;
-            }
+    fn runGroup(cli: *Cli, g: *const Group, argv: []const []const u8) Failure!void {
+        cli.usage_of = g.name;
+        cli.usage = group_usage;
+        var i: usize = 0;
+        while (i < argv.len) : (i += 1) {
+            const arg = argv[i];
+            if (isHelp(arg)) return cli.printGroupHelp(g);
+            if (try cli.globalOption(argv, &i)) continue;
             if (isOption(arg)) return cli.usageError("unrecognized arguments: {s}", .{arg});
-            const full_name = try std.mem.concat(cli.arena, u8, &.{ "config ", arg });
-            const command = findCommand(full_name) orelse
-                return cli.usageError("invalid command '{s}' (choose from 'get', 'set')", .{arg});
+            const full_name = try std.mem.concat(cli.arena, u8, &.{ g.name, " ", arg });
+            const command = findCommand(full_name) orelse {
+                var choices: std.ArrayList(u8) = .empty;
+                for (&commands) |*command| {
+                    const sub = subcommandName(g, command) orelse continue;
+                    if (choices.items.len > 0) try choices.appendSlice(cli.arena, ", ");
+                    try choices.print(cli.arena, "'{s}'", .{sub});
+                }
+                return cli.usageError("invalid command '{s}' (choose from {s})", .{ arg, choices.items });
+            };
             return cli.runCommand(command, argv[i + 1 ..]);
         }
         return cli.usageError("the following arguments are required: <command>", .{});
@@ -369,10 +477,7 @@ const Cli = struct {
                 continue;
             }
             if (isHelp(arg)) return cli.printCommandHelp(command);
-            if (std.mem.eql(u8, arg, "--json")) {
-                cli.json_output = true;
-                continue;
-            }
+            if (try cli.globalOption(argv, &i)) continue;
             const equals = std.mem.indexOfScalar(u8, arg, '=');
             const name = arg[0 .. equals orelse arg.len];
             const option = findOption(command, name) orelse
@@ -399,7 +504,7 @@ const Cli = struct {
         }
 
         if (command.positional) |positional| {
-            if (args.positionals.items.len == 0) {
+            if (args.positionals.items.len == 0 and !command.optional) {
                 return cli.usageError("the following arguments are required: {s}", .{positional});
             }
             if (!command.many and args.positionals.items.len > 1) {
@@ -415,6 +520,26 @@ const Cli = struct {
         return command.handler(cli, &args);
     }
 
+    /// Handles the options that every command takes, and returns whether `argv[i]` was one.
+    fn globalOption(cli: *Cli, argv: []const []const u8, i: *usize) Failure!bool {
+        const arg = argv[i.*];
+        if (std.mem.eql(u8, arg, "--json")) {
+            cli.json_output = true;
+            return true;
+        }
+        if (std.mem.startsWith(u8, arg, "--url=")) {
+            cli.url_flag = arg["--url=".len..];
+            return true;
+        }
+        if (!std.mem.eql(u8, arg, "--url")) return false;
+        if (i.* + 1 == argv.len or isOption(argv[i.* + 1])) {
+            return cli.usageError("argument --url: expected one argument", .{});
+        }
+        i.* += 1;
+        cli.url_flag = argv[i.*];
+        return true;
+    }
+
     fn findOption(command: *const Command, name: []const u8) ?*const Option {
         for (command.options) |*option| {
             if (std.mem.eql(u8, option.name, name)) return option;
@@ -426,30 +551,29 @@ const Cli = struct {
         const w = cli.out;
         try w.print("usage: {s} {s}\n\n{s}\n\ncommands:\n", .{ prog, main_usage, description });
         for (commands) |command| {
-            if (std.mem.startsWith(u8, command.name, "config ")) continue;
+            if (std.mem.indexOfScalar(u8, command.name, ' ') != null) continue;
             var name_buffer: [64]u8 = undefined;
             var name: Writer = .fixed(&name_buffer);
             try name.writeAll(command.name);
             for (command.aliases) |alias| try name.print(" ({s})", .{alias});
             try printHelpLine(w, name.buffered(), command.help);
         }
-        try printHelpLine(w, "config", config_help);
+        for (groups) |g| try printHelpLine(w, g.name, g.help);
         try printHelpLine(w, "help", help_help);
         try w.writeAll("\noptions:\n");
         try printHelpLine(w, "-h, --help", "show this help message and exit");
         try printHelpLine(w, "-v, --version", "show the version and exit");
         try printHelpLine(w, json_option.name, json_option.help);
+        try printHelpLine(w, url_option.name ++ " " ++ url_option.metavar, url_option.help);
         try w.print("\n{s}", .{epilog});
         try w.flush();
     }
 
-    fn printConfigHelp(cli: *Cli) Failure!void {
+    fn printGroupHelp(cli: *Cli, g: *const Group) Failure!void {
         const w = cli.out;
-        try w.print("usage: {s} config {s}\n\n{s}\n\ncommands:\n", .{ prog, config_usage, config_help });
-        for (commands) |command| {
-            if (std.mem.startsWith(u8, command.name, "config ")) {
-                try printHelpLine(w, command.name["config ".len..], command.help);
-            }
+        try w.print("usage: {s} {s} {s}\n\n{s}\n\ncommands:\n", .{ prog, g.name, group_usage, g.help });
+        for (&commands) |*command| {
+            if (subcommandName(g, command)) |sub| try printHelpLine(w, sub, command.help);
         }
         try w.writeAll("\noptions:\n");
         try printHelpLine(w, "-h, --help", "show this help message and exit");
@@ -464,11 +588,15 @@ const Cli = struct {
         }
         if (command.positional) |positional| {
             try w.writeAll("\npositional arguments:\n");
-            try printHelpLine(w, positional, if (command.many) "browser ids" else "browser id");
+            const text = command.positional_help orelse if (command.many) "browser ids" else "browser id";
+            try printHelpLine(w, positional, text);
         }
         try w.writeAll("\noptions:\n");
         try printHelpLine(w, "-h, --help", "show this help message and exit");
         try printHelpLine(w, json_option.name, json_option.help);
+        // Commands that take the server as their argument do not list --url.
+        const takes_url = if (command.positional) |p| std.mem.eql(u8, p, "url") else false;
+        if (!takes_url) try printHelpLine(w, url_option.name ++ " " ++ url_option.metavar, url_option.help);
         for (command.options) |option| {
             const name = if (option.metavar.len == 0)
                 option.name
@@ -507,14 +635,24 @@ const Cli = struct {
         try cli.out.flush();
     }
 
+    /// The client with the credentials from the environment or from the login.
     fn client(cli: *Cli) Failure!*Client {
         if (cli.api) |*api| return api;
-        const api_key = cli.options.api_key orelse "";
-        if (api_key.len == 0) {
-            return cli.fail("The REMOTEBROWSER_API_KEY environment variable is missing or empty.", .{});
+        const auth = try cli.resolveAuth();
+        try cli.checkExpiry(auth);
+        if (auth.expires_at) |expires_at| {
+            if (expires_at - std.time.timestamp() < expiry_warning_days * std.time.s_per_day) {
+                cli.printError("warning: Your login expires on {s}. Run '{s} login' to renew it.", .{
+                    try isoTime(cli.arena, expires_at * std.time.ms_per_s), prog,
+                });
+            }
         }
-        const base_url = cli.options.base_url orelse "";
-        if (base_url.len == 0) return cli.fail("The REMOTEBROWSER_URL environment variable is missing or empty.", .{});
+        cli.source = auth.source;
+        return cli.newClient(auth.base_url, auth.token);
+    }
+
+    /// Only one client exists per run, because `main` reads its error.
+    fn newClient(cli: *Cli, base_url: []const u8, api_key: []const u8) *Client {
         cli.api = .init(cli.gpa, cli.arena, .{
             .api_key = api_key,
             .base_url = base_url,
@@ -523,6 +661,98 @@ const Cli = struct {
         });
         if (cli.options.sleep) |sleep_fn| cli.api.?.sleep = sleep_fn;
         return &cli.api.?;
+    }
+
+    /// The server to use: --url, then REMOTEBROWSER_URL, then the current login. Null if there is none.
+    fn targetUrl(cli: *Cli) Failure!?[]const u8 {
+        const explicit = nonEmpty(cli.url_flag) orelse nonEmpty(cli.options.base_url);
+        if (explicit) |url| return try normalizeUrl(cli.arena, url);
+        return (try cli.loadStore()).current;
+    }
+
+    /// The server given as the argument of login or logout, or else the one from targetUrl.
+    fn serverArgument(cli: *Cli, args: *const Args) Failure!?[]const u8 {
+        if (args.positionals.items.len > 0) return try normalizeUrl(cli.arena, args.positionals.items[0]);
+        return cli.targetUrl();
+    }
+
+    /// Picks the URL and the token. REMOTEBROWSER_API_KEY wins over a login, but each secret is sent
+    /// only to its own server: the key to REMOTEBROWSER_URL, and a login token to the server that issued it.
+    fn resolveAuth(cli: *Cli) Failure!Auth {
+        const env_url = nonEmpty(cli.options.base_url);
+        const env_key = nonEmpty(cli.options.api_key);
+        const base_url = try cli.targetUrl() orelse {
+            if (env_key != null) {
+                return cli.fail("The REMOTEBROWSER_URL environment variable is missing or empty.", .{});
+            }
+            if ((try cli.loadStore()).servers.map.count() > 0) {
+                return cli.fail("No server is chosen. Run '{s} switch URL', or use --url.", .{prog});
+            }
+            return cli.fail("Not logged in. Run '{s} login URL', or set REMOTEBROWSER_URL and " ++
+                "REMOTEBROWSER_API_KEY.", .{prog});
+        };
+        if (env_key) |key| {
+            if (env_url) |url| {
+                if (std.mem.eql(u8, try normalizeUrl(cli.arena, url), base_url)) {
+                    return .{ .base_url = base_url, .token = key, .source = .environment };
+                }
+            }
+        }
+        if ((try cli.loadStore()).servers.map.get(base_url)) |login| {
+            return .{ .base_url = base_url, .token = login.token, .source = .login, .expires_at = login.expires_at };
+        }
+        if (env_key != null and env_url == null) {
+            return cli.fail("The REMOTEBROWSER_URL environment variable is missing or empty.", .{});
+        }
+        return cli.fail("Not logged in to {s}. Run '{s} login {s}', or set REMOTEBROWSER_API_KEY.", .{
+            base_url, prog, base_url,
+        });
+    }
+
+    fn checkExpiry(cli: *Cli, auth: Auth) Failure!void {
+        const expires_at = auth.expires_at orelse return;
+        if (expires_at > std.time.timestamp()) return;
+        return cli.fail("Your login to {s} expired on {s}. Run '{s} login {s}'.", .{
+            auth.base_url, try isoTime(cli.arena, expires_at * std.time.ms_per_s), prog, auth.base_url,
+        });
+    }
+
+    fn credentialsPath(cli: *Cli) Failure![]const u8 {
+        const dir = nonEmpty(cli.options.config_dir) orelse
+            return cli.fail("Cannot find a directory for the login. Set REMOTEBROWSER_CONFIG_DIR.", .{});
+        return std.fs.path.join(cli.arena, &.{ dir, credentials_file });
+    }
+
+    /// The saved logins; empty if there are none.
+    fn loadStore(cli: *Cli) Failure!*Store {
+        if (cli.store_loaded) return &cli.store;
+        cli.store_loaded = true;
+        if (nonEmpty(cli.options.config_dir) == null) return &cli.store;
+        const path = try cli.credentialsPath();
+        const raw = std.fs.cwd().readFileAlloc(cli.arena, path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return &cli.store,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return cli.fail("Cannot read {s}: {t}", .{ path, err }),
+        };
+        cli.store = json.parseFromSliceLeaky(Store, cli.arena, raw, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return cli.fail("Cannot read {s}: the file is not valid. Delete it and log in again.", .{path});
+        return &cli.store;
+    }
+
+    /// Deletes the file when the last login is gone.
+    fn saveStore(cli: *Cli) Failure!void {
+        const path = try cli.credentialsPath();
+        if (cli.store.servers.map.count() == 0) {
+            std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return cli.fail("Cannot delete {s}: {t}", .{ path, err }),
+            };
+            return;
+        }
+        const text = try json.Stringify.valueAlloc(cli.arena, cli.store, .{ .whitespace = .indent_2 });
+        writeSecretFile(path, text) catch |err| return cli.fail("Cannot write {s}: {t}", .{ path, err });
     }
 
     fn sleep(cli: *Cli, seconds: f64) void {
@@ -551,6 +781,102 @@ const Cli = struct {
 };
 
 const Field = struct { key: []const u8, value: json.Value };
+
+const credentials_file = "credentials.json";
+const expiry_warning_days = 3;
+
+/// A login to one server.
+const Login = struct {
+    token: []const u8,
+    /// Seconds since the Unix epoch, or null if the token does not expire.
+    expires_at: ?i64 = null,
+};
+
+/// The credentials file: one login per server, keyed by the normalized base URL.
+const Store = struct {
+    /// The server that commands use when neither --url nor REMOTEBROWSER_URL is given.
+    current: ?[]const u8 = null,
+    servers: json.ArrayHashMap(Login) = .{},
+};
+
+const Source = enum { environment, login };
+
+const Auth = struct {
+    base_url: []const u8,
+    token: []const u8,
+    source: Source,
+    expires_at: ?i64 = null,
+};
+
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    const v = value orelse return null;
+    return if (v.len == 0) null else v;
+}
+
+/// Makes URLs that differ only in case or a trailing slash use the same login.
+fn normalizeUrl(arena: Allocator, url: []const u8) Allocator.Error![]const u8 {
+    const result = try arena.dupe(u8, std.mem.trimRight(u8, std.mem.trim(u8, url, " "), "/"));
+    const scheme_end = std.mem.indexOf(u8, result, "://") orelse return result;
+    const host_end = std.mem.indexOfScalarPos(u8, result, scheme_end + 3, '/') orelse result.len;
+    _ = std.ascii.lowerString(result[0..host_end], result[0..host_end]);
+    return result;
+}
+
+fn isLoopback(url: []const u8) bool {
+    const start = (std.mem.indexOf(u8, url, "://") orelse return false) + 3;
+    const end = std.mem.indexOfScalarPos(u8, url, start, '/') orelse url.len;
+    const authority = url[start..end];
+    if (std.mem.startsWith(u8, authority, "[::1]")) return true;
+    const host = authority[0 .. std.mem.lastIndexOfScalar(u8, authority, ':') orelse authority.len];
+    return std.mem.eql(u8, host, "localhost") or std.mem.startsWith(u8, host, "127.");
+}
+
+test normalizeUrl {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const url = try normalizeUrl(a, "HTTPS://RB.Example:8443/Path/");
+    try std.testing.expectEqualStrings("https://rb.example:8443/Path", url);
+    try std.testing.expectEqualStrings("http://10.0.0.5", try normalizeUrl(a, "http://10.0.0.5"));
+    try std.testing.expect(isLoopback("http://localhost:8080"));
+    try std.testing.expect(isLoopback("http://127.0.0.1"));
+    try std.testing.expect(isLoopback("http://[::1]:80/x"));
+    try std.testing.expect(!isLoopback("http://10.0.0.5:8080"));
+}
+
+/// Writes the file with owner-only permissions, and replaces it atomically so a crash
+/// never leaves half a token.
+fn writeSecretFile(path: []const u8, data: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    var file = try std.fs.cwd().atomicFile(path, .{ .mode = 0o600, .make_path = true, .write_buffer = &buffer });
+    defer file.deinit();
+    try file.file_writer.interface.writeAll(data);
+    try file.finish();
+}
+
+fn openUrl(gpa: Allocator, url: []const u8) void {
+    const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+        .windows => &.{ "rundll32", "url.dll,FileProtocolHandler", url },
+        .macos => &.{ "open", url },
+        else => &.{ "xdg-open", url },
+    };
+    var child: std.process.Child = .init(argv, gpa);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    // The URL is printed too, so a failure here does not matter.
+    _ = child.spawnAndWait() catch {};
+}
+
+/// Reads an integer field, or returns null when it is missing or not a number.
+fn intField(value: json.Value, key: []const u8) ?i64 {
+    if (value != .object) return null;
+    return switch (value.object.get(key) orelse return null) {
+        .integer => |n| n,
+        .float => |f| if (std.math.isFinite(f)) @intFromFloat(f) else null,
+        else => null,
+    };
+}
 
 fn isHelp(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
@@ -617,7 +943,8 @@ fn isSettled(status: []const u8) bool {
     return false;
 }
 
-fn list(cli: *Cli, _: *const Args) Failure!void {
+fn list(cli: *Cli, args: *const Args) Failure!void {
+    if (args.positionals.items.len > 0) cli.url_flag = args.positionals.items[0];
     const result = try (try cli.client()).request(.GET, "/api/v1/browsers", null);
     if (cli.json_output) return cli.printJson(result);
     if (result != .array) return cli.fail("Unexpected response: {f}", .{json.fmt(result, .{})});
@@ -766,4 +1093,210 @@ test isoTime {
     defer arena.deinit();
     try std.testing.expectEqualStrings("1970-01-01T00:00:00.000Z", try isoTime(arena.allocator(), 0));
     try std.testing.expectEqualStrings("2026-11-24T08:30:05.042Z", try isoTime(arena.allocator(), 1795509005042));
+}
+
+const device_grant = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// The OAuth 2.0 device flow (RFC 8628): the user approves the login in a web browser while the CLI polls.
+fn logIn(cli: *Cli, args: *const Args) Failure!void {
+    const days: ?i64 = if (args.get("days")) |text| std.fmt.parseInt(i64, text, 10) catch unreachable else null;
+    if (days) |d| if (d <= 0) return cli.usageError("argument --days: must be at least 1", .{});
+    const base_url = try cli.serverArgument(args) orelse
+        return cli.usageError("the following arguments are required: url", .{});
+    if (!std.mem.startsWith(u8, base_url, "http://") and !std.mem.startsWith(u8, base_url, "https://")) {
+        return cli.usageError("argument url: must start with http:// or https://", .{});
+    }
+    const store = try cli.loadStore();
+    _ = try cli.credentialsPath();
+    if (std.mem.startsWith(u8, base_url, "http://") and !isLoopback(base_url)) {
+        cli.printError("warning: {s} does not use HTTPS, so the token can be read on the network.", .{base_url});
+    }
+
+    const api = cli.newClient(base_url, "");
+    const start = api.request(.POST, "/api/v1/auth/device", try json.Stringify.valueAlloc(cli.arena, .{
+        .client_id = "remotebrowser-cli",
+        .device_name = cli.options.device_name,
+        .days = days,
+    }, .{ .emit_null_optional_fields = false })) catch |err| {
+        if (err == error.ApiFailed and api.last_error.?.status == 404) {
+            return cli.fail("{s} does not support logging in with a web browser. Set REMOTEBROWSER_API_KEY instead.", .{
+                base_url,
+            });
+        }
+        return err;
+    };
+    const device_code = try cli.stringField(start, "device_code");
+    const user_code = try cli.stringField(start, "user_code");
+    const verification_uri = try cli.stringField(start, "verification_uri");
+    const open_uri = if (start.object.get("verification_uri_complete")) |v|
+        (if (v == .string) v.string else verification_uri)
+    else
+        verification_uri;
+    var interval: i64 = @max(intField(start, "interval") orelse 5, 1);
+    const expires_in = intField(start, "expires_in") orelse 900;
+
+    try cli.err.print("To log in, open this URL in a web browser and check that it shows the code {s}:\n\n  {s}\n\n", .{
+        user_code, open_uri,
+    });
+    try cli.err.writeAll("Waiting for the approval...\n");
+    try cli.err.flush();
+    if (!args.flag("no_browser")) cli.options.open_url(cli.gpa, open_uri);
+
+    const poll_body = try json.Stringify.valueAlloc(cli.arena, .{
+        .grant_type = device_grant,
+        .device_code = device_code,
+    }, .{});
+    var waited: i64 = 0;
+    const token = while (true) {
+        if (waited >= expires_in) return cli.fail("The code expired before the login was approved.", .{});
+        cli.sleep(@floatFromInt(interval));
+        waited += interval;
+        const result = api.request(.POST, "/api/v1/auth/token", poll_body) catch |err| switch (err) {
+            error.ApiFailed => {
+                const code = api.errorCode() orelse return err;
+                if (std.mem.eql(u8, code, "authorization_pending")) continue;
+                if (std.mem.eql(u8, code, "slow_down")) {
+                    interval += 5;
+                    continue;
+                }
+                if (std.mem.eql(u8, code, "access_denied")) return cli.fail("The login was denied.", .{});
+                if (std.mem.eql(u8, code, "expired_token")) {
+                    return cli.fail("The code expired before the login was approved.", .{});
+                }
+                return err;
+            },
+            else => return err,
+        };
+        break result;
+    };
+
+    const access_token = try cli.stringField(token, "access_token");
+    const expires_at = if (intField(token, "expires_in")) |seconds| std.time.timestamp() + seconds else null;
+    try store.servers.map.put(cli.arena, base_url, .{ .token = access_token, .expires_at = expires_at });
+    store.current = base_url;
+    try cli.saveStore();
+
+    if (nonEmpty(cli.options.api_key) != null) {
+        if (nonEmpty(cli.options.base_url)) |env_url| {
+            if (std.mem.eql(u8, try normalizeUrl(cli.arena, env_url), base_url)) {
+                cli.printError("warning: REMOTEBROWSER_API_KEY is set, so it is used instead of this login.", .{});
+            }
+        }
+    }
+    if (cli.json_output) return cli.printJson(.{ .url = base_url, .expires_at = expires_at });
+    if (expires_at) |seconds| {
+        const until = try isoTime(cli.arena, seconds * std.time.ms_per_s);
+        try cli.out.print("Logged in to {s} until {s}.\n", .{ base_url, until });
+    } else {
+        try cli.out.print("Logged in to {s}.\n", .{base_url});
+    }
+    try cli.out.flush();
+}
+
+fn logOut(cli: *Cli, args: *const Args) Failure!void {
+    const base_url = try cli.serverArgument(args) orelse return cli.fail("Not logged in.", .{});
+    const store = try cli.loadStore();
+    const login = store.servers.map.get(base_url) orelse return cli.fail("Not logged in to {s}.", .{base_url});
+    const api = cli.newClient(base_url, login.token);
+    // Delete the local copy even when the server cannot be reached, so logging out always works.
+    _ = api.request(.POST, "/api/v1/auth/revoke", "{}") catch |err| switch (err) {
+        error.ApiFailed => {
+            const status = api.last_error.?.status;
+            if (status != 401) cli.printError("warning: Could not revoke the token on the server: {s}", .{
+                api.errorMessage(),
+            });
+        },
+        else => return err,
+    };
+    _ = store.servers.map.orderedRemove(base_url);
+    if (store.current) |current| {
+        if (std.mem.eql(u8, current, base_url)) {
+            // With one login left, the choice is clear; with more, let the user pick one.
+            store.current = if (store.servers.map.count() == 1) store.servers.map.keys()[0] else null;
+        }
+    }
+    try cli.saveStore();
+    try cli.out.print("Logged out of {s}.\n", .{base_url});
+    if (store.current) |current| try cli.out.print("Now using {s}.\n", .{current});
+    try cli.out.flush();
+}
+
+fn switchServer(cli: *Cli, args: *const Args) Failure!void {
+    const base_url = try normalizeUrl(cli.arena, args.positionals.items[0]);
+    const store = try cli.loadStore();
+    if (!store.servers.map.contains(base_url)) {
+        return cli.fail("Not logged in to {s}. Run '{s} login {s}'.", .{ base_url, prog, base_url });
+    }
+    store.current = base_url;
+    try cli.saveStore();
+    if (nonEmpty(cli.options.base_url) != null) {
+        cli.printError("warning: REMOTEBROWSER_URL is set, so it is used instead of this server.", .{});
+    }
+    try cli.out.print("Now using {s}.\n", .{base_url});
+    try cli.out.flush();
+}
+
+/// Lists every login and marks the one that commands use.
+fn showStatus(cli: *Cli, _: *const Args) Failure!void {
+    const store = try cli.loadStore();
+    const auth: ?Auth = cli.resolveAuth() catch |err| switch (err) {
+        error.Failed => null,
+        else => return err,
+    };
+    const Row = struct { url: []const u8, credentials: []const u8, expires_at: ?i64, active: bool };
+    var rows: std.ArrayList(Row) = .empty;
+    if (auth) |a| {
+        if (a.source == .environment) {
+            try rows.append(cli.arena, .{
+                .url = a.base_url,
+                .credentials = "REMOTEBROWSER_API_KEY",
+                .expires_at = null,
+                .active = true,
+            });
+        }
+    }
+    for (store.servers.map.keys(), store.servers.map.values()) |url, login| {
+        const active = if (auth) |a| a.source == .login and std.mem.eql(u8, a.base_url, url) else false;
+        try rows.append(cli.arena, .{
+            .url = url,
+            .credentials = "login",
+            .expires_at = login.expires_at,
+            .active = active,
+        });
+    }
+    // `resolveAuth` has set the message.
+    if (rows.items.len == 0) return error.Failed;
+
+    if (cli.json_output) {
+        try cli.printJson(rows.items);
+    } else {
+        var width: usize = 0;
+        for (rows.items) |row| width = @max(width, row.url.len);
+        const now = std.time.timestamp();
+        for (rows.items) |row| {
+            try cli.out.print("{s} {s}", .{ if (row.active) "*" else " ", row.url });
+            try cli.out.splatByteAll(' ', width - row.url.len + 2);
+            if (std.mem.eql(u8, row.credentials, "login")) {
+                if (row.expires_at) |seconds| {
+                    const verb = if (seconds > now) "expires" else "expired";
+                    const time = try isoTime(cli.arena, seconds * std.time.ms_per_s);
+                    try cli.out.print("login, {s} {s}\n", .{ verb, time });
+                } else {
+                    try cli.out.writeAll("login, does not expire\n");
+                }
+            } else {
+                try cli.out.print("{s}\n", .{row.credentials});
+            }
+        }
+        try cli.out.flush();
+    }
+    // The exit code tells scripts whether commands would work.
+    return cli.checkExpiry(auth orelse return error.Failed);
+}
+
+fn printToken(cli: *Cli, _: *const Args) Failure!void {
+    const auth = try cli.resolveAuth();
+    try cli.checkExpiry(auth);
+    if (cli.json_output) return cli.printJson(.{ .token = auth.token });
+    return cli.line(auth.token);
 }
