@@ -118,7 +118,7 @@ fn makeRequest(client: *Client, method: std.http.Method, path: []const u8, body:
     const authorization = try std.mem.concat(client.arena, u8, &.{ "Bearer ", client.api_key });
 
     var req = client.http.request(method, uri, .{
-        // Not followed, so the API key never goes to another host.
+        // Not followed, so the token never goes to another host.
         .redirect_behavior = .unhandled,
         .headers = .{
             .authorization = if (client.api_key.len == 0) .omit else .{ .override = authorization },

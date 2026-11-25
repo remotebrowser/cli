@@ -8,10 +8,6 @@ pub fn main() u8 {
 
     const argv = std.process.argsAlloc(gpa) catch return outOfMemory();
     defer std.process.argsFree(gpa, argv);
-    const api_key = getEnv(gpa, "REMOTEBROWSER_API_KEY") catch return outOfMemory();
-    defer if (api_key) |value| gpa.free(value);
-    const base_url = getEnv(gpa, "REMOTEBROWSER_URL") catch return outOfMemory();
-    defer if (base_url) |value| gpa.free(value);
     const config_dir = configDir(gpa) catch return outOfMemory();
     defer if (config_dir) |value| gpa.free(value);
     var host_buffer: [256]u8 = undefined;
@@ -23,8 +19,6 @@ pub fn main() u8 {
     var err = std.fs.File.stderr().writer(&err_buffer);
     const args: []const []const u8 = argv[1..];
     return cli.run(gpa, args, .{
-        .api_key = api_key,
-        .base_url = base_url,
         .config_dir = config_dir,
         .device_name = device_name,
     }, &out.interface, &err.interface);

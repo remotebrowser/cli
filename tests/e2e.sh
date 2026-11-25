@@ -2,17 +2,26 @@
 # End-to-end test against a real Remote Browser instance. It launches one browser, runs every
 # command on it, and terminates it.
 #
-# Usage: REMOTEBROWSER_URL=... REMOTEBROWSER_API_KEY=... tests/e2e.sh [path/to/remotebrowser]
+# Usage: remotebrowser login URL, then tests/e2e.sh URL [path/to/remotebrowser]
+#
+# The URL is required so the test never runs on the wrong server by accident.
 
 set -euo pipefail
 
-RB=${1:-zig-out/bin/remotebrowser}
-: "${REMOTEBROWSER_URL:?REMOTEBROWSER_URL is required}"
-: "${REMOTEBROWSER_API_KEY:?REMOTEBROWSER_API_KEY is required}"
+if [[ $# -lt 1 || $1 == -* ]]; then
+  echo "usage: $0 URL [path/to/remotebrowser]" >&2
+  exit 2
+fi
+URL=$1
+RB=${2:-zig-out/bin/remotebrowser}
+
+rb() {
+  "$RB" --url "$URL" "$@"
+}
 
 ID=
 cleanup() {
-  if [[ -n $ID ]]; then "$RB" delete "$ID" >/dev/null 2>&1 || true; fi
+  if [[ -n $ID ]]; then rb delete "$ID" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 
@@ -35,24 +44,24 @@ expect_exit() { # expect_exit <description> <code> <command>...
 }
 
 expect "version" "." "$("$RB" --version)"
-expect "status uses the API key" "credentials: REMOTEBROWSER_API_KEY" "$("$RB" status)"
-expect_exit "usage error" 2 "$RB" get
-expect_exit "unknown browser" 1 "$RB" get Bnonexistent
+expect_exit "status finds a login to $URL" 0 rb status
+expect_exit "usage error" 2 rb get
+expect_exit "unknown browser" 1 rb get Bnonexistent
 
-ID=$("$RB" create --name "remotebrowser-cli-e2e" --description "CLI end-to-end test" --wait)
+ID=$(rb create --name "remotebrowser-cli-e2e" --description "CLI end-to-end test" --wait)
 expect "create --wait prints the id" "B" "$ID"
-expect "list has the browser" "$ID" "$("$RB" list)"
-expect "get shows it running" "status:      running" "$("$RB" get "$ID")"
-expect "get --json" "\"browser_id\": \"$ID\"" "$("$RB" get "$ID" --json)"
-expect "connect prints the CDP URL" "/api/v1/browsers/$ID/cdp" "$("$RB" connect "$ID")"
-expect "config get" "proxy: -" "$("$RB" config get "$ID")"
+expect "list has the browser" "$ID" "$(rb list)"
+expect "get shows it running" "status:      running" "$(rb get "$ID")"
+expect "get --json" "\"browser_id\": \"$ID\"" "$(rb get "$ID" --json)"
+expect "connect prints the CDP URL" "/api/v1/browsers/$ID/cdp" "$(rb connect "$ID")"
+expect "config get" "proxy: -" "$(rb config get "$ID")"
 expect "config set --proxy hides the password" "socks5://user:****@proxy.example:1080" \
-  "$("$RB" config set "$ID" --proxy socks5://user:secret@proxy.example:1080)"
-expect "config set --no-proxy" "\"proxy\": null" "$("$RB" config set "$ID" --no-proxy --json)"
-expect "suspend" "$ID suspended" "$("$RB" suspend "$ID")"
-expect "resume" "$ID running" "$("$RB" resume "$ID")"
-expect_exit "resume a running browser is a conflict" 1 "$RB" resume "$ID"
-expect "delete" "$ID terminated" "$("$RB" delete "$ID")"
+  "$(rb config set "$ID" --proxy socks5://user:secret@proxy.example:1080)"
+expect "config set --no-proxy" "\"proxy\": null" "$(rb config set "$ID" --no-proxy --json)"
+expect "suspend" "$ID suspended" "$(rb suspend "$ID")"
+expect "resume" "$ID running" "$(rb resume "$ID")"
+expect_exit "resume a running browser is a conflict" 1 rb resume "$ID"
+expect "delete" "$ID terminated" "$(rb delete "$ID")"
 ID=
 
 echo "all end-to-end tests passed"

@@ -16,15 +16,12 @@ const description = "Manage browsers on Remote Browser from the command line.";
 const epilog =
     \\To log in with a web browser, run "remotebrowser login URL" once per
     \\server. Commands use the server of the last login (see "switch"), or
-    \\the one given with --url or REMOTEBROWSER_URL. Or set both
-    \\REMOTEBROWSER_API_KEY and REMOTEBROWSER_URL.
+    \\the one given with --url.
     \\
     \\environment:
-    \\  REMOTEBROWSER_API_KEY     API key, used instead of the login
-    \\  REMOTEBROWSER_URL         base URL of the Remote Browser server
     \\  REMOTEBROWSER_CONFIG_DIR  where the login is stored
     \\
-    \\The CDP endpoint printed by "connect" needs the key in the header
+    \\The CDP endpoint printed by "connect" needs the token in the header
     \\"Authorization: Bearer $(remotebrowser token)".
     \\
 ;
@@ -32,10 +29,6 @@ const epilog =
 const main_usage = "[-h] [-v] [--json] [--url URL] <command> ...";
 
 pub const Options = struct {
-    /// From REMOTEBROWSER_API_KEY.
-    api_key: ?[]const u8 = null,
-    /// From REMOTEBROWSER_URL.
-    base_url: ?[]const u8 = null,
     /// The directory of the credentials file. Without it, the CLI cannot log in.
     config_dir: ?[]const u8 = null,
     /// Shown on the approval page of a login.
@@ -108,7 +101,7 @@ const url_option: Option = .{
     .name = "--url",
     .dest = "url",
     .metavar = "URL",
-    .help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+    .help = "base URL of the server (default: the current login)",
 };
 
 const commands = [_]Command{
@@ -156,7 +149,7 @@ const commands = [_]Command{
         .help = "print the ids of the active browsers",
         .usage = "[-h] [--json] [url]",
         .positional = "url",
-        .positional_help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+        .positional_help = "base URL of the server (default: the current login)",
         .optional = true,
         .handler = list,
     },
@@ -205,7 +198,7 @@ const commands = [_]Command{
         .help = "log in with a web browser",
         .usage = "[-h] [--days DAYS] [--no-browser] [url]",
         .positional = "url",
-        .positional_help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+        .positional_help = "base URL of the server (default: the current login)",
         .optional = true,
         .options = &.{
             .{
@@ -224,7 +217,7 @@ const commands = [_]Command{
         .help = "revoke the login to a server and delete it from this computer",
         .usage = "[-h] [url]",
         .positional = "url",
-        .positional_help = "base URL of the server (default: REMOTEBROWSER_URL, or the current login)",
+        .positional_help = "base URL of the server (default: the current login)",
         .optional = true,
         .handler = logOut,
     },
@@ -342,8 +335,8 @@ const Cli = struct {
     message: []const u8 = "",
     /// From --url, which may come before or after the command.
     url_flag: ?[]const u8 = null,
-    /// Where the token of `api` came from, to give a hint when the server rejects it.
-    source: ?Source = null,
+    /// Whether `api` uses a saved login, to give a hint when the server rejects it.
+    uses_login: bool = false,
     /// Loaded on first use; see `loadStore`.
     store: Store = .{},
     store_loaded: bool = false,
@@ -372,7 +365,7 @@ const Cli = struct {
                 const api = &cli.api.?;
                 cli.printError("{s}", .{api.errorMessage()});
                 const status = if (api.last_error) |e| e.status else null;
-                if (status == 401 and cli.source == .login) cli.printError("Run '{s} login' to log in again.", .{prog});
+                if (status == 401 and cli.uses_login) cli.printError("Run '{s} login' to log in again.", .{prog});
                 return 1;
             },
             error.OutOfMemory => {
@@ -635,7 +628,7 @@ const Cli = struct {
         try cli.out.flush();
     }
 
-    /// The client with the credentials from the environment or from the login.
+    /// The client with the token of the login.
     fn client(cli: *Cli) Failure!*Client {
         if (cli.api) |*api| return api;
         const auth = try cli.resolveAuth();
@@ -647,7 +640,7 @@ const Cli = struct {
                 });
             }
         }
-        cli.source = auth.source;
+        cli.uses_login = true;
         return cli.newClient(auth.base_url, auth.token);
     }
 
@@ -663,10 +656,9 @@ const Cli = struct {
         return &cli.api.?;
     }
 
-    /// The server to use: --url, then REMOTEBROWSER_URL, then the current login. Null if there is none.
+    /// The server to use: --url, then the current login. Null if there is none.
     fn targetUrl(cli: *Cli) Failure!?[]const u8 {
-        const explicit = nonEmpty(cli.url_flag) orelse nonEmpty(cli.options.base_url);
-        if (explicit) |url| return try normalizeUrl(cli.arena, url);
+        if (nonEmpty(cli.url_flag)) |url| return try normalizeUrl(cli.arena, url);
         return (try cli.loadStore()).current;
     }
 
@@ -676,37 +668,17 @@ const Cli = struct {
         return cli.targetUrl();
     }
 
-    /// Picks the URL and the token. REMOTEBROWSER_API_KEY wins over a login, but each secret is sent
-    /// only to its own server: the key to REMOTEBROWSER_URL, and a login token to the server that issued it.
+    /// Picks the URL and the token. A token is sent only to the server that issued it.
     fn resolveAuth(cli: *Cli) Failure!Auth {
-        const env_url = nonEmpty(cli.options.base_url);
-        const env_key = nonEmpty(cli.options.api_key);
         const base_url = try cli.targetUrl() orelse {
-            if (env_key != null) {
-                return cli.fail("The REMOTEBROWSER_URL environment variable is missing or empty.", .{});
-            }
             if ((try cli.loadStore()).servers.map.count() > 0) {
                 return cli.fail("No server is chosen. Run '{s} switch URL', or use --url.", .{prog});
             }
-            return cli.fail("Not logged in. Run '{s} login URL', or set REMOTEBROWSER_URL and " ++
-                "REMOTEBROWSER_API_KEY.", .{prog});
+            return cli.fail("Not logged in. Run '{s} login URL'.", .{prog});
         };
-        if (env_key) |key| {
-            if (env_url) |url| {
-                if (std.mem.eql(u8, try normalizeUrl(cli.arena, url), base_url)) {
-                    return .{ .base_url = base_url, .token = key, .source = .environment };
-                }
-            }
-        }
-        if ((try cli.loadStore()).servers.map.get(base_url)) |login| {
-            return .{ .base_url = base_url, .token = login.token, .source = .login, .expires_at = login.expires_at };
-        }
-        if (env_key != null and env_url == null) {
-            return cli.fail("The REMOTEBROWSER_URL environment variable is missing or empty.", .{});
-        }
-        return cli.fail("Not logged in to {s}. Run '{s} login {s}', or set REMOTEBROWSER_API_KEY.", .{
-            base_url, prog, base_url,
-        });
+        const login = (try cli.loadStore()).servers.map.get(base_url) orelse
+            return cli.fail("Not logged in to {s}. Run '{s} login {s}'.", .{ base_url, prog, base_url });
+        return .{ .base_url = base_url, .token = login.token, .expires_at = login.expires_at };
     }
 
     fn checkExpiry(cli: *Cli, auth: Auth) Failure!void {
@@ -794,17 +766,14 @@ const Login = struct {
 
 /// The credentials file: one login per server, keyed by the normalized base URL.
 const Store = struct {
-    /// The server that commands use when neither --url nor REMOTEBROWSER_URL is given.
+    /// The server that commands use when --url is not given.
     current: ?[]const u8 = null,
     servers: json.ArrayHashMap(Login) = .{},
 };
 
-const Source = enum { environment, login };
-
 const Auth = struct {
     base_url: []const u8,
     token: []const u8,
-    source: Source,
     expires_at: ?i64 = null,
 };
 
@@ -1119,9 +1088,7 @@ fn logIn(cli: *Cli, args: *const Args) Failure!void {
         .days = days,
     }, .{ .emit_null_optional_fields = false })) catch |err| {
         if (err == error.ApiFailed and api.last_error.?.status == 404) {
-            return cli.fail("{s} does not support logging in with a web browser. Set REMOTEBROWSER_API_KEY instead.", .{
-                base_url,
-            });
+            return cli.fail("{s} does not support logging in with a web browser.", .{base_url});
         }
         return err;
     };
@@ -1176,13 +1143,6 @@ fn logIn(cli: *Cli, args: *const Args) Failure!void {
     store.current = base_url;
     try cli.saveStore();
 
-    if (nonEmpty(cli.options.api_key) != null) {
-        if (nonEmpty(cli.options.base_url)) |env_url| {
-            if (std.mem.eql(u8, try normalizeUrl(cli.arena, env_url), base_url)) {
-                cli.printError("warning: REMOTEBROWSER_API_KEY is set, so it is used instead of this login.", .{});
-            }
-        }
-    }
     if (cli.json_output) return cli.printJson(.{ .url = base_url, .expires_at = expires_at });
     if (expires_at) |seconds| {
         const until = try isoTime(cli.arena, seconds * std.time.ms_per_s);
@@ -1229,9 +1189,6 @@ fn switchServer(cli: *Cli, args: *const Args) Failure!void {
     }
     store.current = base_url;
     try cli.saveStore();
-    if (nonEmpty(cli.options.base_url) != null) {
-        cli.printError("warning: REMOTEBROWSER_URL is set, so it is used instead of this server.", .{});
-    }
     try cli.out.print("Now using {s}.\n", .{base_url});
     try cli.out.flush();
 }
@@ -1243,26 +1200,11 @@ fn showStatus(cli: *Cli, _: *const Args) Failure!void {
         error.Failed => null,
         else => return err,
     };
-    const Row = struct { url: []const u8, credentials: []const u8, expires_at: ?i64, active: bool };
+    const Row = struct { url: []const u8, expires_at: ?i64, active: bool };
     var rows: std.ArrayList(Row) = .empty;
-    if (auth) |a| {
-        if (a.source == .environment) {
-            try rows.append(cli.arena, .{
-                .url = a.base_url,
-                .credentials = "REMOTEBROWSER_API_KEY",
-                .expires_at = null,
-                .active = true,
-            });
-        }
-    }
     for (store.servers.map.keys(), store.servers.map.values()) |url, login| {
-        const active = if (auth) |a| a.source == .login and std.mem.eql(u8, a.base_url, url) else false;
-        try rows.append(cli.arena, .{
-            .url = url,
-            .credentials = "login",
-            .expires_at = login.expires_at,
-            .active = active,
-        });
+        const active = if (auth) |a| std.mem.eql(u8, a.base_url, url) else false;
+        try rows.append(cli.arena, .{ .url = url, .expires_at = login.expires_at, .active = active });
     }
     // `resolveAuth` has set the message.
     if (rows.items.len == 0) return error.Failed;
@@ -1276,16 +1218,12 @@ fn showStatus(cli: *Cli, _: *const Args) Failure!void {
         for (rows.items) |row| {
             try cli.out.print("{s} {s}", .{ if (row.active) "*" else " ", row.url });
             try cli.out.splatByteAll(' ', width - row.url.len + 2);
-            if (std.mem.eql(u8, row.credentials, "login")) {
-                if (row.expires_at) |seconds| {
-                    const verb = if (seconds > now) "expires" else "expired";
-                    const time = try isoTime(cli.arena, seconds * std.time.ms_per_s);
-                    try cli.out.print("login, {s} {s}\n", .{ verb, time });
-                } else {
-                    try cli.out.writeAll("login, does not expire\n");
-                }
+            if (row.expires_at) |seconds| {
+                const verb = if (seconds > now) "expires" else "expired";
+                const time = try isoTime(cli.arena, seconds * std.time.ms_per_s);
+                try cli.out.print("login, {s} {s}\n", .{ verb, time });
             } else {
-                try cli.out.print("{s}\n", .{row.credentials});
+                try cli.out.writeAll("login, does not expire\n");
             }
         }
         try cli.out.flush();
