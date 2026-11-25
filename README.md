@@ -2,6 +2,21 @@
 
 `remotebrowser` is a command-line tool for the [Remote Browser REST API](https://remotebrowser.ai/api/).
 
+## Install
+
+On Linux, macOS, or FreeBSD:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/remotebrowser/cli/main/install.sh | bash
+```
+
+The script downloads the latest release for your platform, checks its checksum, and installs `remotebrowser` to
+`~/.local/bin`. Set `REMOTEBROWSER_INSTALL_DIR` to install elsewhere, or `REMOTEBROWSER_VERSION` (such as `0.2.0`) to
+install a specific version. On Windows, download the zip file from the
+[latest release](https://github.com/remotebrowser/cli/releases/latest).
+
+## Log in
+
 Log in once to each server with a web browser:
 
 ```bash
