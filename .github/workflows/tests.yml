@@ -24,3 +24,21 @@ jobs:
 
       - name: Run tests
         run: zig build test --summary all
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build
+
+      - name: Run end-to-end tests against the mock server
+        run: tests/e2e_mock.sh
