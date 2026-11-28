@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const curl = @import("curl.zig");
 
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -15,6 +16,7 @@ pub const default_max_retries: u32 = 2;
 const max_retry_delay: f64 = 60;
 const max_response_size = 16 * 1024 * 1024;
 const user_agent = "remotebrowser-cli/" ++ build_options.version;
+const use_libcurl = build_options.libcurl;
 
 /// Allocates the HTTP connections. Must be thread-safe if the client is shared between threads.
 gpa: Allocator,
@@ -29,7 +31,7 @@ timeout_ms: u32 = default_timeout_ms,
 max_retries: u32 = default_max_retries,
 /// Tests replace this to skip the waits between retries.
 sleep: *const fn (seconds: f64) void = defaultSleep,
-http: std.http.Client,
+http: if (use_libcurl) curl.Session else std.http.Client,
 /// Set when a method returns error.ApiFailed.
 last_error: ?ApiError = null,
 
@@ -60,7 +62,7 @@ pub fn init(gpa: Allocator, arena: Allocator, options: Options) Client {
         .base_url = std.mem.trimRight(u8, options.base_url, "/"),
         .timeout_ms = options.timeout_ms,
         .max_retries = options.max_retries,
-        .http = .{ .allocator = gpa },
+        .http = if (use_libcurl) .{} else .{ .allocator = gpa },
     };
 }
 
@@ -111,10 +113,64 @@ fn connectionError(client: *Client, timed_out: bool) error{ApiFailed} {
         .{ .message = "Connection error." });
 }
 
+const Response = struct {
+    status: u16,
+    retry_after: ?f64,
+    body: []const u8,
+};
+
 fn makeRequest(client: *Client, method: std.http.Method, path: []const u8, body: ?[]const u8) Error!json.Value {
     const url = try std.mem.concat(client.arena, u8, &.{ client.base_url, path });
-    const uri = std.Uri.parse(url) catch
-        return client.fail(.{ .message = try std.fmt.allocPrint(client.arena, "Invalid URL: {s}", .{url}) });
+    const uri = std.Uri.parse(url) catch return client.invalidUrl(url);
+    const response = if (use_libcurl)
+        try client.sendCurl(method, url, body)
+    else
+        try client.sendStd(method, url, uri, body);
+
+    const parsed = try parseBody(client.arena, response.body);
+    if (response.status >= 300) {
+        return client.fail(.{
+            .status = response.status,
+            .message = try errorText(client.arena, response.status, parsed),
+            .retry_after = response.retry_after,
+            .body = parsed,
+        });
+    }
+    return parsed;
+}
+
+fn invalidUrl(client: *Client, url: []const u8) Error {
+    const message = std.fmt.allocPrint(client.arena, "Invalid URL: {s}", .{url}) catch return error.OutOfMemory;
+    return client.fail(.{ .message = message });
+}
+
+fn sendCurl(client: *Client, method: std.http.Method, url: []const u8, body: ?[]const u8) Error!Response {
+    const arena = client.arena;
+    var headers: std.ArrayList([:0]const u8) = .empty;
+    try headers.append(arena, "Accept: application/json");
+    if (body != null or method.requestHasBody()) try headers.append(arena, "Content-Type: application/json");
+    if (client.api_key.len > 0) try headers.append(arena, try std.fmt.allocPrintSentinel(arena, "Authorization: Bearer {s}", .{client.api_key}, 0));
+
+    const response = client.http.send(arena, .{
+        .method = @tagName(method),
+        .url = try arena.dupeZ(u8, url),
+        .headers = headers.items,
+        .user_agent = user_agent,
+        .body = if (method.requestHasBody()) body orelse "" else null,
+        .timeout_ms = client.timeout_ms,
+        .max_response_size = max_response_size,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUrl => client.invalidUrl(url),
+        error.TimedOut => client.connectionError(true),
+        error.ResponseTooLarge => client.fail(.{ .message = "The response is too large." }),
+        error.Unavailable => client.fail(.{ .message = "Cannot load libcurl." }),
+        error.ConnectionFailed => client.connectionError(false),
+    };
+    return .{ .status = response.status, .retry_after = response.retry_after, .body = response.body };
+}
+
+fn sendStd(client: *Client, method: std.http.Method, url: []const u8, uri: std.Uri, body: ?[]const u8) Error!Response {
     const authorization = try std.mem.concat(client.arena, u8, &.{ "Bearer ", client.api_key });
 
     var req = client.http.request(method, uri, .{
@@ -132,9 +188,7 @@ fn makeRequest(client: *Client, method: std.http.Method, path: []const u8, body:
         .extra_headers = &.{.{ .name = "Accept", .value = "application/json" }},
     }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.UnsupportedUriScheme, error.UriMissingHost, error.UriHostTooLong => client.fail(.{
-            .message = try std.fmt.allocPrint(client.arena, "Invalid URL: {s}", .{url}),
-        }),
+        error.UnsupportedUriScheme, error.UriMissingHost, error.UriHostTooLong => client.invalidUrl(url),
         error.ConnectionTimedOut => client.connectionError(true),
         else => client.connectionError(false),
     };
@@ -171,16 +225,7 @@ fn makeRequest(client: *Client, method: std.http.Method, path: []const u8, body:
         error.ReadFailed => return client.connectionError(isTimeout(req.connection)),
     };
 
-    const parsed = try parseBody(client.arena, raw);
-    if (status >= 300) {
-        return client.fail(.{
-            .status = status,
-            .message = try errorText(client.arena, status, parsed),
-            .retry_after = retry_after,
-            .body = parsed,
-        });
-    }
-    return parsed;
+    return .{ .status = status, .retry_after = retry_after, .body = raw };
 }
 
 /// Parses a JSON body, keeping a body that is not JSON as a string, because proxies in front of the

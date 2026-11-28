@@ -6,9 +6,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from the executable");
+    const libcurl = b.option(bool, "libcurl", "Send HTTP requests with the libcurl of the system (default: on for macOS)") orelse
+        (target.result.os.tag == .macos);
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
+    options.addOption(bool, "libcurl", libcurl);
 
     const exe = b.addExecutable(.{
         .name = "remotebrowser",
@@ -31,6 +34,7 @@ pub fn build(b: *std.Build) void {
     // The tests also run the built executable, so they get its path.
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "version", version);
+    test_options.addOption(bool, "libcurl", libcurl);
     test_options.addOptionPath("exe_path", exe.getEmittedBin());
 
     const tests = b.addTest(.{
